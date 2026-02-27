@@ -1,16 +1,30 @@
 import { NextResponse } from "next/server";
+import crypto from "crypto";
 
 type QueueItem = { id: string; url: string; submittedAt: string };
 
+// URL 정규화: 공백 제거 + #fragment 제거
+function normalizeUrl(raw: string) {
+  const s = String(raw ?? "").trim();
+  try {
+    const u = new URL(s);
+    u.hash = ""; // #... 제거
+    return u.toString();
+  } catch {
+    return s;
+  }
+}
+
+// 충돌 거의 없는 id: sha256(url) 앞 16바이트(32 hex)
 function makeId(url: string) {
-  // 간단 ID (충돌 확률 낮음)
-  return Buffer.from(url).toString("base64").replace(/=+/g, "").slice(0, 16);
+  return crypto.createHash("sha256").update(url).digest("hex").slice(0, 32);
 }
 
 export async function POST(req: Request) {
   try {
     const body = await req.json().catch(() => null);
-    const url = String(body?.url ?? "").trim();
+    const rawUrl = String(body?.url ?? "");
+    const url = normalizeUrl(rawUrl);
     const inputSecret = String(body?.secret ?? "").trim();
 
     if (!url || !/^https?:\/\//i.test(url)) {
@@ -38,10 +52,10 @@ export async function POST(req: Request) {
     }
 
     const path = "data/queue.json";
-    const getUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${encodeURIComponent(path)}?ref=${branch}`;
+    const apiUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${encodeURIComponent(path)}?ref=${branch}`;
 
     // 1) queue.json 읽기
-    const getRes = await fetch(getUrl, {
+    const getRes = await fetch(apiUrl, {
       headers: {
         Authorization: `token ${token}`,
         "User-Agent": "quiet-digest",
@@ -70,14 +84,17 @@ export async function POST(req: Request) {
       queue = [];
     }
 
-    // 중복 방지
     const id = makeId(url);
-    if (queue.some((q) => q.url === url || q.id === id)) {
+
+    // ✅ 중복 체크: 정규화 URL 또는 id가 같은 경우만 중복
+    const exists = queue.some((q) => normalizeUrl(q.url) === url || q.id === id);
+    if (exists) {
       return NextResponse.json({ ok: true, skipped: true }, { status: 200 });
     }
 
+    // 앞에 추가
     queue.unshift({ id, url, submittedAt: new Date().toISOString() });
-    queue = queue.slice(0, 200);
+    queue = queue.slice(0, 300);
 
     // 2) queue.json 업데이트
     const putRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/contents/${encodeURIComponent(path)}`, {
@@ -104,7 +121,7 @@ export async function POST(req: Request) {
       );
     }
 
-    return NextResponse.json({ ok: true }, { status: 200 });
+    return NextResponse.json({ ok: true, skipped: false }, { status: 200 });
   } catch (e: any) {
     return NextResponse.json({ error: String(e?.message ?? e) }, { status: 500 });
   }
